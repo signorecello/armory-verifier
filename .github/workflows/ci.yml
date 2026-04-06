@@ -33,9 +33,10 @@ jobs:
 
       - name: Install bb (barretenberg)
         run: |
-          curl -L https://raw.githubusercontent.com/AztecProtocol/aztec-packages/refs/heads/master/barretenberg/bbup/install | bash
-          $HOME/.bb/bbup
-          echo "$HOME/.bb" >> $GITHUB_PATH
+          BB_VERSION=$(curl -s "https://api.github.com/repos/AztecProtocol/aztec-packages/releases" | grep -o '"tag_name": "v[0-9][^"]*nightly[^"]*"' | head -1 | cut -d'"' -f4)
+          echo "Installing bb from release $BB_VERSION"
+          curl -fsSL "https://github.com/AztecProtocol/aztec-packages/releases/download/${BB_VERSION}/barretenberg-amd64-linux.tar.gz" | tar xz -C /usr/local/bin
+          bb --version
 
       - name: Verify all circuits (armory-verifier)
         run: |
