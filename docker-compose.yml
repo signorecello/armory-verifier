@@ -1,0 +1,66 @@
+services:
+  # Native build and test (uses host architecture)
+  verifier:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ./artifacts:/data/artifacts:ro
+
+  # ARM emulated build and test (armv7 via QEMU, tuned for USB Armory MK II)
+  verifier-arm:
+    build:
+      context: .
+      dockerfile: Dockerfile.arm
+    platform: linux/arm/v7
+    volumes:
+      - ./artifacts:/data/artifacts:ro
+
+  # Benchmark all circuits on native
+  benchmark:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ./artifacts:/data/artifacts:ro
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        echo "=== Native Benchmark ==="
+        for circuit in example arithmetic hash large range; do
+          echo ""
+          echo "--- $$circuit ---"
+          for i in 1 2 3; do
+            start=$$(date +%s%N)
+            result=$$(armory-verifier -p /data/artifacts/$$circuit/proof -k /data/artifacts/$$circuit/vk -i /data/artifacts/$$circuit/public_inputs 2>/dev/null)
+            end=$$(date +%s%N)
+            ms=$$(( (end - start) / 1000000 ))
+            echo "  Run $$i: $${ms}ms ($$result)"
+          done
+        done
+
+  # Benchmark all circuits on ARM (emulated, Cortex-A7, no NEON)
+  benchmark-arm:
+    build:
+      context: .
+      dockerfile: Dockerfile.arm
+    platform: linux/arm/v7
+    volumes:
+      - ./artifacts:/data/artifacts:ro
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        echo "=== ARM (emulated armv7, Cortex-A7, no NEON) Benchmark ==="
+        for circuit in example arithmetic hash large range; do
+          echo ""
+          echo "--- $$circuit ---"
+          for i in 1 2 3; do
+            start=$$(date +%s%N)
+            result=$$(armory-verifier -p /data/artifacts/$$circuit/proof -k /data/artifacts/$$circuit/vk -i /data/artifacts/$$circuit/public_inputs 2>/dev/null)
+            end=$$(date +%s%N)
+            ms=$$(( (end - start) / 1000000 ))
+            echo "  Run $$i: $${ms}ms ($$result)"
+          done
+        done

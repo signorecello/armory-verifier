@@ -1,0 +1,6 @@
+[package]
+name = "circuit_hash"
+type = "bin"
+authors = [""]
+
+[dependencies]

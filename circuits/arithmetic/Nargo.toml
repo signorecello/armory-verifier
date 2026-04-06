@@ -1,0 +1,6 @@
+[package]
+name = "circuit_arithmetic"
+type = "bin"
+authors = [""]
+
+[dependencies]
