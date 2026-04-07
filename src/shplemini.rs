@@ -111,8 +111,8 @@ fn check_evals_consistency(
     // Batch-invert all 256 denominators (1 inversion instead of 256)
     let mut root_power = one;
     let mut raw_denoms = vec![Fr::from(0u64); SUBGROUP_SIZE];
-    for idx in 0..SUBGROUP_SIZE {
-        raw_denoms[idx] = root_power * gemini_r - one;
+    for denom in raw_denoms.iter_mut() {
+        *denom = root_power * gemini_r - one;
         root_power *= SUBGROUP_GENERATOR_INVERSE;
     }
     let denominators = batch_inverse(&raw_denoms);
