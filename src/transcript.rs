@@ -1,6 +1,5 @@
 use ark_bn254::Fr;
 use ark_ff::{BigInteger, PrimeField};
-use num_bigint::BigUint;
 use tiny_keccak::{Hasher, Keccak};
 
 use crate::types::*;
@@ -46,25 +45,31 @@ fn hash_to_fr(hash: [u8; 32]) -> Fr {
     Fr::from_be_bytes_mod_order(&hash)
 }
 
-/// Split a challenge into two 127-bit values (matching Verifier.sol splitChallenge)
+/// Split a challenge into two values: low 127 bits and high bits (matching Verifier.sol splitChallenge)
+/// Uses direct byte manipulation instead of BigUint for efficiency on ARM.
 fn split_challenge(challenge: Fr) -> (Fr, Fr) {
-    let bytes = fr_to_bytes32(challenge);
-    let val = BigUint::from_bytes_be(&bytes);
-    let mask = (BigUint::from(1u64) << 127) - BigUint::from(1u64);
-    let lo = &val & &mask;
-    let hi = &val >> 127;
+    let bytes = fr_to_bytes32(challenge); // big-endian: bytes[0]=MSB, bytes[31]=LSB
 
-    let lo_fr = Fr::from_be_bytes_mod_order(&biguint_to_32_bytes(&lo));
-    let hi_fr = Fr::from_be_bytes_mod_order(&biguint_to_32_bytes(&hi));
+    // lo: low 127 bits (bits 0-126)
+    // In BE layout: bytes[16..32] contain bits 0-127, clear the top bit of bytes[16]
+    let mut lo = [0u8; 32];
+    lo[16..32].copy_from_slice(&bytes[16..32]);
+    lo[16] &= 0x7F;
+
+    // hi: bits 127..255, right-shifted to start at bit 0
+    // hi_value = (full_value >> 127) = bytes[0..16] * 2 + (bytes[16] >> 7)
+    // In BE: left-shift bytes[0..16] by 1 bit, carry in the top bit of bytes[16]
+    let mut hi = [0u8; 32];
+    // Result lands in hi[16..32] (at most 129 bits = 17 bytes, but MSB byte may overflow to hi[15])
+    hi[15] = bytes[0] >> 7;
+    for i in 0..15 {
+        hi[16 + i] = (bytes[i] << 1) | (bytes[i + 1] >> 7);
+    }
+    hi[31] = (bytes[15] << 1) | (bytes[16] >> 7);
+
+    let lo_fr = Fr::from_be_bytes_mod_order(&lo);
+    let hi_fr = Fr::from_be_bytes_mod_order(&hi);
     (lo_fr, hi_fr)
-}
-
-fn biguint_to_32_bytes(val: &BigUint) -> [u8; 32] {
-    let be_bytes = val.to_bytes_be();
-    let mut result = [0u8; 32];
-    let start = 32usize.saturating_sub(be_bytes.len());
-    result[start..start + be_bytes.len()].copy_from_slice(&be_bytes);
-    result
 }
 
 /// Generate the complete Fiat-Shamir transcript
@@ -79,7 +84,8 @@ pub fn generate_transcript(
 
     // === Eta challenge ===
     // Size: 1 (vkHash) + numPublicInputs + 8 (geminiMask(2) + 3 wires(6))
-    let mut round0_data: Vec<u8> = Vec::new();
+    let round0_size = (1 + public_inputs.len() + PAIRING_POINTS_SIZE + 8) * 32;
+    let mut round0_data: Vec<u8> = Vec::with_capacity(round0_size);
     round0_data.extend_from_slice(&fr_to_bytes32(vk_hash));
 
     // Public inputs (non-pairing)
@@ -109,7 +115,7 @@ pub fn generate_transcript(
     let (eta_three, _) = split_challenge(prev_challenge);
 
     // === Beta and Gamma ===
-    let mut round1_data: Vec<u8> = Vec::new();
+    let mut round1_data: Vec<u8> = Vec::with_capacity(7 * 32);
     round1_data.extend_from_slice(&fr_to_bytes32(prev_challenge));
     round1_data.extend_from_slice(&fq_to_bytes32(proof.lookup_read_counts.x));
     round1_data.extend_from_slice(&fq_to_bytes32(proof.lookup_read_counts.y));
@@ -122,7 +128,7 @@ pub fn generate_transcript(
     let (beta, gamma) = split_challenge(prev_challenge);
 
     // === Alpha ===
-    let mut alpha_data: Vec<u8> = Vec::new();
+    let mut alpha_data: Vec<u8> = Vec::with_capacity(5 * 32);
     alpha_data.extend_from_slice(&fr_to_bytes32(prev_challenge));
     alpha_data.extend_from_slice(&fq_to_bytes32(proof.lookup_inverses.x));
     alpha_data.extend_from_slice(&fq_to_bytes32(proof.lookup_inverses.y));
@@ -149,7 +155,7 @@ pub fn generate_transcript(
     }
 
     // === Libra challenge ===
-    let mut libra_data: Vec<u8> = Vec::new();
+    let mut libra_data: Vec<u8> = Vec::with_capacity(4 * 32);
     libra_data.extend_from_slice(&fr_to_bytes32(prev_challenge));
     libra_data.extend_from_slice(&fq_to_bytes32(proof.libra_commitments[0].x));
     libra_data.extend_from_slice(&fq_to_bytes32(proof.libra_commitments[0].y));
@@ -160,8 +166,9 @@ pub fn generate_transcript(
 
     // === Sumcheck challenges ===
     let mut sum_check_u_challenges = vec![Fr::from(0u64); log_n];
+    let mut sc_data: Vec<u8> = Vec::with_capacity((1 + ZK_BATCHED_RELATION_PARTIAL_LENGTH) * 32);
     for (round, sc_challenge) in sum_check_u_challenges.iter_mut().enumerate() {
-        let mut sc_data: Vec<u8> = Vec::new();
+        sc_data.clear();
         sc_data.extend_from_slice(&fr_to_bytes32(prev_challenge));
         for j in 0..ZK_BATCHED_RELATION_PARTIAL_LENGTH {
             sc_data.extend_from_slice(&fr_to_bytes32(proof.sumcheck_univariates[round][j]));
@@ -173,7 +180,7 @@ pub fn generate_transcript(
 
     // === Rho challenge ===
     // Elements: prevChallenge + NUMBER_OF_ENTITIES_ZK evals + libraEval + 2 libra comms (4 coords)
-    let mut rho_data: Vec<u8> = Vec::new();
+    let mut rho_data: Vec<u8> = Vec::with_capacity((2 + NUMBER_OF_ENTITIES_ZK + 4) * 32);
     rho_data.extend_from_slice(&fr_to_bytes32(prev_challenge));
     for i in 0..NUMBER_OF_ENTITIES_ZK {
         rho_data.extend_from_slice(&fr_to_bytes32(proof.sumcheck_evaluations[i]));
@@ -188,7 +195,7 @@ pub fn generate_transcript(
     let (rho, _) = split_challenge(prev_challenge);
 
     // === Gemini R challenge ===
-    let mut gemini_data: Vec<u8> = Vec::new();
+    let mut gemini_data: Vec<u8> = Vec::with_capacity((1 + 2 * (log_n - 1)) * 32);
     gemini_data.extend_from_slice(&fr_to_bytes32(prev_challenge));
     for i in 0..log_n - 1 {
         gemini_data.extend_from_slice(&fq_to_bytes32(proof.gemini_fold_comms[i].x));
@@ -199,7 +206,7 @@ pub fn generate_transcript(
     let (gemini_r, _) = split_challenge(prev_challenge);
 
     // === Shplonk Nu challenge ===
-    let mut nu_data: Vec<u8> = Vec::new();
+    let mut nu_data: Vec<u8> = Vec::with_capacity((1 + log_n + 4) * 32);
     nu_data.extend_from_slice(&fr_to_bytes32(prev_challenge));
     for i in 0..log_n {
         nu_data.extend_from_slice(&fr_to_bytes32(proof.gemini_a_evaluations[i]));
@@ -212,7 +219,7 @@ pub fn generate_transcript(
     let (shplonk_nu, _) = split_challenge(prev_challenge);
 
     // === Shplonk Z challenge ===
-    let mut z_data: Vec<u8> = Vec::new();
+    let mut z_data: Vec<u8> = Vec::with_capacity(3 * 32);
     z_data.extend_from_slice(&fr_to_bytes32(prev_challenge));
     z_data.extend_from_slice(&fq_to_bytes32(proof.shplonk_q.x));
     z_data.extend_from_slice(&fq_to_bytes32(proof.shplonk_q.y));

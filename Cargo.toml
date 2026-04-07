@@ -8,10 +8,10 @@ ark-bn254 = "0.5"
 ark-ec = "0.5"
 ark-ff = "0.5"
 tiny-keccak = { version = "2", features = ["keccak"] }
-num-bigint = "0.4"
 
 [profile.release]
 opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
+panic = "abort"

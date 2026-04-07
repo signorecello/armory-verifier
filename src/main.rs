@@ -5,6 +5,7 @@ mod shplemini;
 mod sumcheck;
 mod transcript;
 mod types;
+mod utils;
 
 use ark_bn254::Fr;
 use ark_ff::{Field, PrimeField};
