@@ -1,9 +1,9 @@
 use ark_bn254::Fr;
-use ark_ff::Field;
 
 use crate::constants::*;
 use crate::relations;
 use crate::types::*;
+use crate::utils::batch_inverse_array;
 
 /// Verify the sumcheck protocol
 pub fn verify_sumcheck(proof: &ZKProof, tp: &ZKTranscript, log_n: usize) -> bool {
@@ -70,14 +70,13 @@ fn compute_next_target_sum(
         numerator_value *= round_challenge - Fr::from(i as u64);
     }
 
-    // Compute denominator inverses
-    let mut denominator_inverses = [Fr::from(0u64); ZK_BATCHED_RELATION_PARTIAL_LENGTH];
+    // Batch-invert all 9 denominators (1 inversion instead of 9)
+    let mut raw_denoms = [Fr::from(0u64); ZK_BATCHED_RELATION_PARTIAL_LENGTH];
     for i in 0..ZK_BATCHED_RELATION_PARTIAL_LENGTH {
-        let denom = BARYCENTRIC_LAGRANGE_DENOMINATORS[i] * (round_challenge - Fr::from(i as u64));
-        denominator_inverses[i] = denom
-            .inverse()
-            .expect("Barycentric denominator should be non-zero");
+        raw_denoms[i] =
+            BARYCENTRIC_LAGRANGE_DENOMINATORS[i] * (round_challenge - Fr::from(i as u64));
     }
+    let denominator_inverses = batch_inverse_array(&raw_denoms);
 
     let mut target_sum = Fr::from(0u64);
     for i in 0..ZK_BATCHED_RELATION_PARTIAL_LENGTH {

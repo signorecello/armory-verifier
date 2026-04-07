@@ -151,7 +151,6 @@ dependencies = [
  "ark-bn254",
  "ark-ec",
  "ark-ff",
- "num-bigint",
  "tiny-keccak",
 ]
 

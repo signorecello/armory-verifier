@@ -1,27 +1,24 @@
 use ark_bn254::{Bn254, Fq, Fr, G1Affine, G1Projective, G2Affine};
 use ark_ec::{pairing::Pairing, CurveGroup, VariableBaseMSM};
 use ark_ff::{BigInteger, Field, PrimeField, Zero};
-use num_bigint::BigUint;
 use tiny_keccak::{Hasher, Keccak};
 
 use crate::constants::*;
 use crate::transcript::fr_to_bytes32;
 use crate::types::*;
+use crate::utils::batch_inverse;
 
-/// Reconstruct a Fq field element from 4 x 68-bit limbs stored as Fr values
+/// Reconstruct a Fq field element from 4 x 68-bit limbs stored as Fr values.
+/// Uses Horner's method in Fq: result = limb[3]*2^68^3 + limb[2]*2^68^2 + limb[1]*2^68 + limb[0]
+/// 3 Fq multiplications + 4 additions, zero heap allocation.
 fn reconstruct_fq_from_limbs(limbs: &[Fr]) -> Fq {
-    let mut val = BigUint::from(0u64);
-    for (i, limb) in limbs.iter().enumerate() {
-        let bytes = fr_to_bytes32(*limb);
-        let limb_val = BigUint::from_bytes_be(&bytes);
-        val += limb_val << (68 * i);
+    let shift = Fq::from(1u128 << 68);
+    let mut result = Fq::from(0u64);
+    for limb in limbs.iter().rev() {
+        let limb_fq = Fq::from_be_bytes_mod_order(&fr_to_bytes32(*limb));
+        result = result * shift + limb_fq;
     }
-    let mut be_bytes = val.to_bytes_be();
-    // Pad to 32 bytes
-    while be_bytes.len() < 32 {
-        be_bytes.insert(0, 0);
-    }
-    Fq::from_be_bytes_mod_order(&be_bytes)
+    result
 }
 
 /// Convert pairing point limbs to two G1 points (lhs, rhs)
@@ -47,6 +44,7 @@ fn compute_squares(r: Fr, log_n: usize) -> Vec<Fr> {
 }
 
 /// Compute fold positive evaluations (Gemini)
+/// Denominators are independent of the sequential accumulator, so we batch-invert them upfront.
 fn compute_fold_pos_evaluations(
     sumcheck_u_challenges: &[Fr],
     mut batched_eval_accumulator: Fr,
@@ -58,14 +56,22 @@ fn compute_fold_pos_evaluations(
     let two = Fr::from(2u64);
     let mut fold_pos_evaluations = vec![Fr::from(0u64); log_size];
 
+    // Precompute all denominators and batch-invert (log_n inversions -> 1)
+    let mut raw_denoms = vec![Fr::from(0u64); log_size];
     for i in (1..=log_size).rev() {
+        let challenge_power = gemini_eval_challenge_powers[i - 1];
+        let u = sumcheck_u_challenges[i - 1];
+        raw_denoms[log_size - i] = challenge_power * (one - u) + u;
+    }
+    let inv_denoms = batch_inverse(&raw_denoms);
+
+    for (j, i) in (1..=log_size).rev().enumerate() {
         let challenge_power = gemini_eval_challenge_powers[i - 1];
         let u = sumcheck_u_challenges[i - 1];
 
         let numerator = challenge_power * batched_eval_accumulator * two
             - gemini_evaluations[i - 1] * (challenge_power * (one - u) - u);
-        let denominator = challenge_power * (one - u) + u;
-        let batched_eval_round_acc = numerator * denominator.inverse().unwrap();
+        let batched_eval_round_acc = numerator * inv_denoms[j];
 
         batched_eval_accumulator = batched_eval_round_acc;
         fold_pos_evaluations[i - 1] = batched_eval_round_acc;
@@ -102,16 +108,18 @@ fn check_evals_consistency(
     }
 
     // Evaluate challenge polynomial at gemini_r using Lagrange interpolation over subgroup
+    // Batch-invert all 256 denominators (1 inversion instead of 256)
     let mut root_power = one;
-    let mut challenge_poly_eval = Fr::from(0u64);
-    let mut denominators = vec![Fr::from(0u64); SUBGROUP_SIZE];
-
-    for idx in 0..SUBGROUP_SIZE {
-        denominators[idx] = (root_power * gemini_r - one)
-            .inverse()
-            .expect("denominator should be non-zero");
-        challenge_poly_eval += challenge_poly_lagrange[idx] * denominators[idx];
+    let mut raw_denoms = vec![Fr::from(0u64); SUBGROUP_SIZE];
+    for denom in raw_denoms.iter_mut() {
+        *denom = root_power * gemini_r - one;
         root_power *= SUBGROUP_GENERATOR_INVERSE;
+    }
+    let denominators = batch_inverse(&raw_denoms);
+
+    let mut challenge_poly_eval = Fr::from(0u64);
+    for idx in 0..SUBGROUP_SIZE {
+        challenge_poly_eval += challenge_poly_lagrange[idx] * denominators[idx];
     }
 
     let numerator = vanishing_poly_eval * Fr::from(SUBGROUP_SIZE as u64).inverse().unwrap();
@@ -235,17 +243,30 @@ pub fn verify_shplemini(
     let mut scalars = vec![Fr::from(0u64); msm_size];
     let mut commitments: Vec<G1Affine> = vec![G1Affine::identity(); msm_size];
 
-    // Initial denominators
-    let pos_inv_denom_0 = (tp.shplonk_z - powers_of_eval_challenge[0])
-        .inverse()
-        .unwrap();
-    let neg_inv_denom_0 = (tp.shplonk_z + powers_of_eval_challenge[0])
-        .inverse()
-        .unwrap();
+    // Batch-invert all denominators in verify_shplemini at once:
+    // [0] = shplonk_z - r, [1] = shplonk_z + r, [2] = gemini_r,
+    // [3..3+2*(log_n-1)] = fold loop pos/neg pairs,
+    // [3+2*(log_n-1)] = shplonk_z - gemini_r, [3+2*(log_n-1)+1] = shplonk_z - omega*gemini_r
+    let denom_count = 3 + 2 * (log_n - 1) + 2;
+    let mut all_denoms = vec![Fr::from(0u64); denom_count];
+    all_denoms[0] = tp.shplonk_z - powers_of_eval_challenge[0];
+    all_denoms[1] = tp.shplonk_z + powers_of_eval_challenge[0];
+    all_denoms[2] = tp.gemini_r;
+    for i in 0..log_n - 1 {
+        all_denoms[3 + 2 * i] = tp.shplonk_z - powers_of_eval_challenge[i + 1];
+        all_denoms[3 + 2 * i + 1] = tp.shplonk_z + powers_of_eval_challenge[i + 1];
+    }
+    let libra_denom_offset = 3 + 2 * (log_n - 1);
+    all_denoms[libra_denom_offset] = tp.shplonk_z - tp.gemini_r;
+    all_denoms[libra_denom_offset + 1] = tp.shplonk_z - SUBGROUP_GENERATOR * tp.gemini_r;
+    let inv_denoms = batch_inverse(&all_denoms);
+
+    let pos_inv_denom_0 = inv_denoms[0];
+    let neg_inv_denom_0 = inv_denoms[1];
+    let gemini_r_inv = inv_denoms[2];
 
     let unshifted_scalar = pos_inv_denom_0 + tp.shplonk_nu * neg_inv_denom_0;
-    let shifted_scalar =
-        tp.gemini_r.inverse().unwrap() * (pos_inv_denom_0 - tp.shplonk_nu * neg_inv_denom_0);
+    let shifted_scalar = gemini_r_inv * (pos_inv_denom_0 - tp.shplonk_nu * neg_inv_denom_0);
 
     // First entry: shplonkQ
     scalars[0] = one;
@@ -331,14 +352,10 @@ pub fn verify_shplemini(
     batching_challenge = tp.shplonk_nu.square();
     let boundary = NUMBER_UNSHIFTED_ZK + 1;
 
-    // Gemini fold commitment contributions
+    // Gemini fold commitment contributions (using batch-inverted denominators)
     for i in 0..log_n - 1 {
-        let pos_inv = (tp.shplonk_z - powers_of_eval_challenge[i + 1])
-            .inverse()
-            .unwrap();
-        let neg_inv = (tp.shplonk_z + powers_of_eval_challenge[i + 1])
-            .inverse()
-            .unwrap();
+        let pos_inv = inv_denoms[3 + 2 * i];
+        let neg_inv = inv_denoms[3 + 2 * i + 1];
 
         let scaling_factor_pos = batching_challenge * pos_inv;
         let scaling_factor_neg = batching_challenge * tp.shplonk_nu * neg_inv;
@@ -355,12 +372,10 @@ pub fn verify_shplemini(
 
     let libra_boundary = boundary + log_n - 1;
 
-    // Libra evaluation contributions
-    let denom_0 = (tp.shplonk_z - tp.gemini_r).inverse().unwrap();
-    let denom_1 = (tp.shplonk_z - SUBGROUP_GENERATOR * tp.gemini_r)
-        .inverse()
-        .unwrap();
-    let denominators = [denom_0, denom_1, denom_0, denom_0];
+    // Libra evaluation contributions (using batch-inverted denominators)
+    let libra_inv_0 = inv_denoms[libra_denom_offset];
+    let libra_inv_1 = inv_denoms[libra_denom_offset + 1];
+    let denominators = [libra_inv_0, libra_inv_1, libra_inv_0, libra_inv_0];
 
     batching_challenge *= tp.shplonk_nu * tp.shplonk_nu;
     let mut batching_scalars = [Fr::from(0u64); 4];
