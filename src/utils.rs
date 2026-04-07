@@ -44,7 +44,9 @@ pub fn batch_inverse_array<const N: usize>(values: &[Fr; N]) -> [Fr; N] {
         return result;
     }
     if N == 1 {
-        result[0] = values[0].inverse().expect("batch_inverse_array: zero element");
+        result[0] = values[0]
+            .inverse()
+            .expect("batch_inverse_array: zero element");
         return result;
     }
 

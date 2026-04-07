@@ -266,8 +266,7 @@ pub fn verify_shplemini(
     let gemini_r_inv = inv_denoms[2];
 
     let unshifted_scalar = pos_inv_denom_0 + tp.shplonk_nu * neg_inv_denom_0;
-    let shifted_scalar =
-        gemini_r_inv * (pos_inv_denom_0 - tp.shplonk_nu * neg_inv_denom_0);
+    let shifted_scalar = gemini_r_inv * (pos_inv_denom_0 - tp.shplonk_nu * neg_inv_denom_0);
 
     // First entry: shplonkQ
     scalars[0] = one;

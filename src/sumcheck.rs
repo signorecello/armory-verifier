@@ -73,7 +73,8 @@ fn compute_next_target_sum(
     // Batch-invert all 9 denominators (1 inversion instead of 9)
     let mut raw_denoms = [Fr::from(0u64); ZK_BATCHED_RELATION_PARTIAL_LENGTH];
     for i in 0..ZK_BATCHED_RELATION_PARTIAL_LENGTH {
-        raw_denoms[i] = BARYCENTRIC_LAGRANGE_DENOMINATORS[i] * (round_challenge - Fr::from(i as u64));
+        raw_denoms[i] =
+            BARYCENTRIC_LAGRANGE_DENOMINATORS[i] * (round_challenge - Fr::from(i as u64));
     }
     let denominator_inverses = batch_inverse_array(&raw_denoms);
 
