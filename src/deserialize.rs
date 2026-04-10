@@ -1,3 +1,5 @@
+use alloc::vec::Vec;
+
 use ark_bn254::{Fq, Fr, G1Affine};
 use ark_ff::PrimeField;
 

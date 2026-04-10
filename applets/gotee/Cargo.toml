@@ -1,0 +1,16 @@
+[workspace]
+
+[package]
+name = "armory-verifier-gotee"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+armory-verifier = { path = "../..", default-features = false }
+linked_list_allocator = "0.10"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"

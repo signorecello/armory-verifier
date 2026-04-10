@@ -1,3 +1,5 @@
+use alloc::vec::Vec;
+
 use ark_bn254::{Fr, G1Affine};
 
 /// Number of subrelations in Ultra Honk

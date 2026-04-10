@@ -1,3 +1,6 @@
+use alloc::vec;
+use alloc::vec::Vec;
+
 use ark_bn254::{Bn254, Fq, Fr, G1Affine, G1Projective, G2Affine};
 use ark_ec::{pairing::Pairing, CurveGroup, VariableBaseMSM};
 use ark_ff::{BigInteger, Field, PrimeField, Zero};
@@ -92,6 +95,7 @@ fn check_evals_consistency(
     // Compute vanishing polynomial: r^256 - 1
     let vanishing_poly_eval = gemini_r.pow([SUBGROUP_SIZE as u64]) - one;
     if vanishing_poly_eval == Fr::from(0u64) {
+        #[cfg(feature = "std")]
         eprintln!("Gemini challenge is in subgroup!");
         return false;
     }
@@ -408,6 +412,7 @@ pub fn verify_shplemini(
         proof.libra_evaluation,
         log_n,
     ) {
+        #[cfg(feature = "std")]
         eprintln!("Shplemini: Libra consistency check failed");
         return false;
     }

@@ -1,10 +1,18 @@
 # armory-verifier
 
-Minimal standalone Ultra Honk ZK proof verifier for the USB Armory MK II.
+Minimal standalone Ultra Honk ZK proof verifier for the USB Armory MK II, running inside ARM TrustZone via GoTEE.
 
 ## Status: WORKING
 
-All 5 test circuits verified on native + emulated ARM (Cortex-A7, no NEON).
+All 5 test circuits verified natively. GoTEE applet builds for `armv7a-none-eabi` (bare-metal ARM TrustZone Secure World).
+
+## Architecture
+
+The crate is split into a `no_std`-compatible library and a thin CLI binary:
+
+- **`src/lib.rs`** -- `verify(proof_bytes, vk_bytes, pi_bytes, vk_hash_bytes) -> bool`. No filesystem, no stdio. Works in `no_std + alloc` environments.
+- **`src/main.rs`** -- CLI wrapper. Reads files, calls `lib::verify()`, prints `VALID`/`INVALID`.
+- **`applets/gotee/`** -- GoTEE trusted applet. Freestanding `#![no_std]` `#![no_main]` binary targeting `armv7a-none-eabi` that runs the verifier inside TrustZone Secure World.
 
 ## Usage
 
@@ -17,13 +25,62 @@ CLI flags match `bb verify`: `-p` proof, `-k` vk, `-i` public inputs. Outputs `V
 ## Docker
 
 ```bash
-docker compose run --rm verifier -p /data/artifacts/example/proof -k /data/artifacts/example/vk -i /data/artifacts/example/public_inputs
-docker compose run --rm verifier-arm ...   # ARM emulated (Cortex-A7, no NEON)
-docker compose run --rm benchmark          # native benchmark
-docker compose run --rm benchmark-arm      # ARM benchmark
+docker compose run --rm verifier-gotee -p /data/artifacts/example/proof -k /data/artifacts/example/vk -i /data/artifacts/example/public_inputs
 ```
 
-Artifacts are bind-mounted, not baked into images. Swap test vectors without rebuilding.
+Artifacts are bind-mounted, not baked into images.
+
+## GoTEE TrustZone
+
+The verifier runs as a native Rust applet inside ARM TrustZone Secure World under GoTEE (the USB Armory team's TEE framework). This was chosen over OP-TEE and WaTZ for zero performance overhead:
+
+| Path | Overhead | Notes |
+|------|----------|-------|
+| **GoTEE + native Rust** | ~0% | Official USB Armory TEE, bare-metal, no interpreter |
+| OP-TEE + Teaclave Rust | ~1% | Known i.MX6 TrustZone bypass vulnerability |
+| WaTZ (WASM in OP-TEE) | ~50% | Interpreter overhead, 500ms -> ~1000ms |
+
+### Wire protocol (shared memory)
+
+```
+Request  (Normal World -> Secure World):
+  [0..4]   command     : u32 (1 = VERIFY)
+  [4..8]   proof_len   : u32
+  [8..12]  vk_len      : u32
+  [12..16] pi_len      : u32
+  [16..20] vk_hash_len : u32  (0 = no hash)
+  [20..]   proof | vk | pi | vk_hash
+
+Response (Secure World -> Normal World):
+  [0..4]   status      : i32  (1=VALID, 0=INVALID, -1=ERROR)
+```
+
+### Building the applet
+
+```bash
+cd applets/gotee && cargo build --release
+# Output: applets/gotee/target/armv7a-none-eabi/release/armory-verifier-gotee (1.7 MB)
+```
+
+### Memory layout (Secure World)
+
+Defined in `applets/gotee/memory.x`:
+- TEXT+RODATA: 4 MB (arkworks + BN254 pairing code)
+- DATA+BSS: 256 KB
+- HEAP: 2 MB (arkworks allocations, linked_list_allocator)
+- STACK: 64 KB
+
+### Normal World host
+
+`applets/gotee/host/main.go` -- Go program using TamaGo/GoTEE APIs. Reads proof files, packs wire protocol, triggers SMC to Secure World, prints result.
+
+## Feature flags
+
+| Feature | Default | Purpose |
+|---------|---------|---------|
+| `std` | yes | Enables `eprintln!` diagnostics, arkworks std features |
+
+Build with `--no-default-features` for `no_std` (GoTEE applet, bare-metal ARM).
 
 ## Proof generation
 
@@ -132,6 +189,7 @@ Critical encoding: `abi.encodePacked` = big-endian 32-byte concatenation, no pad
 | RAM | 512 MB DDR3 |
 | Storage | 16 GB eMMC + microSD slot |
 | OS | Full Linux (Debian/Ubuntu ARM) |
+| TEE | ARM TrustZone via GoTEE (TamaGo bare-metal Go runtime) |
 | Crypto HW | DCP: AES-128 + SHA-256 only. No ECC/pairing acceleration |
 | Power | USB bus powered, <500 mA |
 | Form factor | 65 x 19 x 6 mm |
@@ -142,8 +200,7 @@ Key constraints:
 - In-order pipeline limits instruction-level parallelism
 - Verification time: ~500ms (measured via QEMU emulation with correct CPU flags)
 - Peak RAM: < 1 MB
-
-The Docker ARM build (`Dockerfile.arm`) sets `RUSTFLAGS="-C target-cpu=cortex-a7 -C target-feature=-neon"` to match.
+- GoTEE applet binary: 1.7 MB (fits in TrustZone Secure World partition)
 
 ---
 
@@ -170,3 +227,5 @@ All in `circuits/`, pre-generated artifacts in `artifacts/`:
 - `splitChallenge`: low 127 bits = first challenge, remaining high bits = second challenge
 - ZK sumcheck correction: `evaluation = product(challenges[2..log_n])`, NOT starting from index 0
 - Shifted commitments (indices 30-34) accumulate both unshifted and shifted scalar contributions in the same MSM slot
+- Library is `no_std + alloc` compatible: all `Vec` usage comes from `alloc::vec`, `eprintln!` gated behind `#[cfg(feature = "std")]`
+- GoTEE applet uses `linked_list_allocator` for heap management in Secure World

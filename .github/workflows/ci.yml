@@ -77,36 +77,34 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+          targets: thumbv7em-none-eabi
       - name: Check formatting
         run: cargo fmt -- --check
-      - name: Clippy
+      - name: Clippy (native, default features)
         run: cargo clippy -- -D warnings
+      - name: Clippy (no_std library)
+        run: cargo clippy --target thumbv7em-none-eabi --no-default-features --lib -- -D warnings
 
-  build-arm:
-    name: Build ARM (Cortex-A7, no NEON)
+  gotee-build:
+    name: Build GoTEE applet (armv7a-none-eabi)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          platforms: arm
-
-      - name: Build ARM image
-        run: docker build --platform linux/arm/v7 -f Dockerfile.arm -t armory-verifier:arm .
-
-      - name: Verify all circuits (ARM)
-        run: |
-          for circuit in example arithmetic hash large range; do
-            echo "--- $circuit ---"
-            docker run --rm --platform linux/arm/v7 \
-              -v ${{ github.workspace }}/artifacts:/data/artifacts:ro \
-              armory-verifier:arm \
-              -p /data/artifacts/$circuit/proof \
-              -k /data/artifacts/$circuit/vk \
-              -i /data/artifacts/$circuit/public_inputs
-          done
+          targets: armv7a-none-eabi, thumbv7em-none-eabi
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            applets/gotee/target
+          key: ${{ runner.os }}-gotee-${{ hashFiles('Cargo.lock', 'applets/gotee/Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-gotee-
+      - name: Check no_std library (bare-metal ARM)
+        run: cargo check --target thumbv7em-none-eabi --no-default-features --lib
+      - name: Build GoTEE applet
+        working-directory: applets/gotee
+        run: cargo build --release

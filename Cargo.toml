@@ -3,10 +3,22 @@ name = "armory-verifier"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "armory_verifier"
+path = "src/lib.rs"
+
+[[bin]]
+name = "armory-verifier"
+path = "src/main.rs"
+
+[features]
+default = ["std"]
+std = ["ark-bn254/std", "ark-ec/std", "ark-ff/std"]
+
 [dependencies]
-ark-bn254 = "0.5"
-ark-ec = "0.5"
-ark-ff = "0.5"
+ark-bn254 = { version = "0.5", default-features = false, features = ["curve"] }
+ark-ec = { version = "0.5", default-features = false }
+ark-ff = { version = "0.5", default-features = false }
 tiny-keccak = { version = "2", features = ["keccak"] }
 
 [profile.release]

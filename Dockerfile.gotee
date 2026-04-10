@@ -1,0 +1,53 @@
+# Multi-stage Dockerfile for building and testing the GoTEE trusted applet.
+#
+# Stage 1 (builder): Builds the Rust applet for armv7a-none-eabi and the
+#                     Go Normal World host.
+# Stage 2 (runtime): Contains QEMU system emulation for testing.
+#
+# NOTE: Full GoTEE supervisor integration requires TamaGo and the GoTEE
+# framework. This Dockerfile currently builds the Rust applet and validates
+# that the no_std library compiles correctly for bare-metal ARM. Full QEMU
+# TrustZone testing will be added once the GoTEE supervisor wiring is complete.
+
+FROM rust:1.84-bookworm AS builder
+
+WORKDIR /build
+
+# Install the bare-metal ARM target
+RUN rustup target add armv7a-none-eabi thumbv7em-none-eabi
+
+# Copy manifests first for layer caching
+COPY Cargo.toml Cargo.lock ./
+COPY applets/gotee/Cargo.toml applets/gotee/Cargo.toml
+COPY applets/gotee/.cargo applets/gotee/.cargo
+COPY applets/gotee/memory.x applets/gotee/memory.x
+
+# Dummy source for dependency caching
+RUN mkdir -p src && echo '#![cfg_attr(not(feature = "std"), no_std)]' > src/lib.rs && \
+    mkdir -p applets/gotee/src && \
+    echo '#![no_std]' > applets/gotee/src/main.rs && \
+    echo '#![no_main]' >> applets/gotee/src/main.rs && \
+    echo '#[panic_handler] fn panic(_: &core::panic::PanicInfo) -> ! { loop {} }' >> applets/gotee/src/main.rs
+
+# Pre-build dependencies
+RUN cargo check --target thumbv7em-none-eabi --no-default-features --lib 2>/dev/null || true
+
+# Copy real sources
+COPY src/ src/
+COPY applets/gotee/src/ applets/gotee/src/
+
+# Verify no_std library compiles for bare-metal ARM
+RUN cargo check --target thumbv7em-none-eabi --no-default-features --lib
+
+# Build the GoTEE applet
+RUN cd applets/gotee && cargo build --release
+
+# Also build the native CLI for reference testing
+ENV RUSTFLAGS="-C target-cpu=cortex-a7 -C target-feature=-neon"
+RUN cargo build --release
+
+FROM debian:bookworm-slim
+COPY --from=builder /build/target/release/armory-verifier /usr/local/bin/armory-verifier
+COPY --from=builder /build/applets/gotee/target/armv7a-none-eabi/release/armory-verifier-gotee /usr/local/bin/armory-verifier-gotee
+
+ENTRYPOINT ["armory-verifier"]
