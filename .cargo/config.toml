@@ -1,0 +1,11 @@
+# Linker flags for the WaTZ target. The secure-world TA has a tight memory
+# budget, so we cap max memory at 8 MB and start at 2 MB (enough headroom for
+# the verifier's ~1 MB peak working set). `--stack-first` places the shadow
+# stack below the heap so a stack overflow traps cleanly instead of corrupting
+# allocator metadata.
+[target.wasm32-unknown-unknown]
+rustflags = [
+  "-C", "link-arg=--initial-memory=2097152",
+  "-C", "link-arg=--max-memory=8388608",
+  "-C", "link-arg=--stack-first",
+]

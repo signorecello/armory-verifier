@@ -1,0 +1,82 @@
+# Multi-stage build of the armory-verifier wasm module + a Cortex-A7 ARMv7
+# smoke harness that runs the module under a pure-Rust WASM interpreter.
+#
+# Stages:
+#   builder  (native)        -> produces /out/armory_verifier.wasm
+#                               and /out/wasm-smoke (armv7 ELF)
+#   export   (native, scratch) -> just the .wasm (for `verifier-wasm`)
+#   runtime  (linux/arm/v7)  -> QEMU-emulated USB Armory MK II environment
+#                               running the verifier via wasmi interpreter
+#                               (for `verifier-wasm-smoke`)
+
+ARG BUILDPLATFORM=linux/amd64
+FROM --platform=$BUILDPLATFORM rust:1.84-bookworm AS builder
+
+WORKDIR /build
+
+# binaryen                   -> wasm-opt (size pass on the .wasm)
+# gcc-arm-linux-gnueabihf     -> armv7 hard-float cross compiler
+# libc6-dev-armhf-cross       -> glibc headers + Scrt1.o/crti.o/crtn.o for linking
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      binaryen \
+      gcc-arm-linux-gnueabihf \
+      libc6-dev-armhf-cross \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN rustup target add wasm32-unknown-unknown armv7-unknown-linux-gnueabihf
+
+COPY Cargo.toml Cargo.lock ./
+COPY .cargo/ .cargo/
+COPY src/ src/
+COPY tools/ tools/
+
+# 1. Build the wasm module. --no-default-features keeps the debug-log
+#    feature off so the module is mute (no stdio exists in the TEE).
+RUN cargo build \
+      --profile release-wasm \
+      --target wasm32-unknown-unknown \
+      --no-default-features \
+      --lib
+
+# 2. wasm-opt size pass.
+RUN mkdir -p /out && \
+    wasm-opt -Oz --strip-debug --strip-producers \
+      -o /out/armory_verifier.wasm \
+      target/wasm32-unknown-unknown/release-wasm/armory_verifier.wasm && \
+    ls -lh /out/armory_verifier.wasm
+
+# 3. Cross-compile the smoke harness to armv7 Cortex-A7 to match the USB
+#    Armory MK II's i.MX6ULZ. NEON is already disabled by default in the
+#    armv7-unknown-linux-gnueabihf target definition (the triple assumes
+#    vfp3+d32 hard-float, no NEON) so we only need to pin target-cpu.
+ENV CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER=arm-linux-gnueabihf-gcc
+ENV CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_RUSTFLAGS="-C target-cpu=cortex-a7"
+
+RUN cargo build \
+      --manifest-path tools/wasm-smoke/Cargo.toml \
+      --release \
+      --target armv7-unknown-linux-gnueabihf && \
+    cp tools/wasm-smoke/target/armv7-unknown-linux-gnueabihf/release/wasm-smoke /out/wasm-smoke && \
+    file /out/wasm-smoke
+
+# ---- export stage: tiny native image holding just the .wasm ----
+# Used by `docker compose run --rm verifier-wasm` to copy the built module
+# out to a host bind mount. Stays on the build platform so it doesn't need
+# QEMU for a pure file-copy operation.
+FROM --platform=$BUILDPLATFORM debian:bookworm-slim AS export
+
+COPY --from=builder /out/armory_verifier.wasm /opt/armory_verifier.wasm
+
+# ---- runtime stage: linux/arm/v7, the WaTZ-like environment ----
+# Docker Desktop (and Linux hosts with qemu-user-static + binfmt_misc) run
+# this under user-mode QEMU ARMv7 emulation. The smoke harness was built
+# for Cortex-A7 with NEON disabled, and wasmi does zero code generation,
+# so CPU-level characteristics closely mirror what you'd see running the
+# same wasm under WAMR classic-interp inside a WaTZ TA on the real Armory.
+FROM --platform=linux/arm/v7 debian:bookworm-slim AS runtime
+
+COPY --from=builder /out/armory_verifier.wasm /opt/armory_verifier.wasm
+COPY --from=builder /out/wasm-smoke           /usr/local/bin/wasm-smoke
+
+ENTRYPOINT ["/usr/local/bin/wasm-smoke", "/opt/armory_verifier.wasm", "/data/artifacts"]

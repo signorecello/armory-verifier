@@ -16,11 +16,14 @@ pub fn verify_sumcheck(proof: &ZKProof, tp: &ZKTranscript, log_n: usize) -> bool
         let total_sum = round_univariate[0] + round_univariate[1];
 
         if total_sum != round_target_sum {
-            eprintln!("Sumcheck failed at round {round}:");
-            eprintln!("  total_sum:        {:?}", total_sum);
-            eprintln!("  round_target_sum: {:?}", round_target_sum);
-            eprintln!("  u[0]: {:?}", round_univariate[0]);
-            eprintln!("  u[1]: {:?}", round_univariate[1]);
+            #[cfg(feature = "debug-log")]
+            {
+                eprintln!("Sumcheck failed at round {round}:");
+                eprintln!("  total_sum:        {:?}", total_sum);
+                eprintln!("  round_target_sum: {:?}", round_target_sum);
+                eprintln!("  u[0]: {:?}", round_univariate[0]);
+                eprintln!("  u[1]: {:?}", round_univariate[1]);
+            }
             return false;
         }
 
@@ -52,6 +55,7 @@ pub fn verify_sumcheck(proof: &ZKProof, tp: &ZKTranscript, log_n: usize) -> bool
         grand_honk_relation_sum * (one - evaluation) + proof.libra_evaluation * tp.libra_challenge;
 
     if corrected != round_target_sum {
+        #[cfg(feature = "debug-log")]
         eprintln!("Sumcheck final check failed");
         return false;
     }

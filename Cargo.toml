@@ -3,6 +3,14 @@ name = "armory-verifier"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# Off by default — wasm module must stay mute. Enable locally for native debugging.
+default = []
+debug-log = []
+
 [dependencies]
 ark-bn254 = "0.5"
 ark-ec = "0.5"
@@ -15,3 +23,8 @@ lto = true
 codegen-units = 1
 strip = true
 panic = "abort"
+
+# Size-tuned profile for wasm32-unknown-unknown. Native ARM uses `release`.
+[profile.release-wasm]
+inherits = "release"
+opt-level = "z"

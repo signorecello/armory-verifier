@@ -1,0 +1,26 @@
+[package]
+name = "wasm-smoke"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone host harness. Loads the built armory-verifier .wasm into a
+# pure-Rust WASM interpreter (wasmi) and verifies every test-circuit
+# artifact through the verifier's C-ABI exports.
+#
+# wasmi is deliberate: WaTZ runs WAMR's classic-interp inside an OP-TEE TA.
+# A JIT like wasmtime would give numbers 10-50x faster than anything we'll
+# ever see on the real Armory, and cranelift doesn't cross-compile cleanly
+# to armv7 anyway. wasmi matches WAMR's characteristics (pure interpreter,
+# zero code generation) and has no C dependencies — so the same harness
+# cross-compiles to armv7-unknown-linux-gnueabihf for the QEMU benchmark.
+
+[dependencies]
+anyhow = "1"
+wasmi = { version = "0.40", default-features = false, features = ["std"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

@@ -10,13 +10,15 @@ env:
 
 jobs:
   build-and-test:
-    name: Build & verify circuits
+    name: Build wasm + verify circuits
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -25,30 +27,36 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+            tools/wasm-smoke/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock', 'tools/wasm-smoke/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
-      - name: Build
-        run: cargo build --release
+      - name: Build wasm module
+        run: |
+          cargo build \
+            --profile release-wasm \
+            --target wasm32-unknown-unknown \
+            --no-default-features \
+            --lib
+          ls -lh target/wasm32-unknown-unknown/release-wasm/armory_verifier.wasm
 
-      - name: Install bb (barretenberg)
+      - name: Build smoke harness
+        run: cargo build --manifest-path tools/wasm-smoke/Cargo.toml --release
+
+      - name: Verify all circuits through wasm ABI
+        run: |
+          tools/wasm-smoke/target/release/wasm-smoke \
+            target/wasm32-unknown-unknown/release-wasm/armory_verifier.wasm \
+            artifacts
+
+      - name: Install bb (barretenberg) for reference check
         run: |
           # Pin to the version used to generate the test artifacts
           BB_VERSION=v4.0.0-nightly.20260120
           curl -fsSL "https://github.com/AztecProtocol/aztec-packages/releases/download/${BB_VERSION}/barretenberg-amd64-linux.tar.gz" | tar xz -C /usr/local/bin
           bb --version
 
-      - name: Verify all circuits (armory-verifier)
-        run: |
-          for circuit in example arithmetic hash large range; do
-            echo "--- $circuit ---"
-            ./target/release/armory-verifier \
-              -p artifacts/$circuit/proof \
-              -k artifacts/$circuit/vk \
-              -i artifacts/$circuit/public_inputs
-          done
-
-      - name: Verify all circuits (bb verify)
+      - name: Reference-verify all circuits (bb verify)
         run: |
           for circuit in example arithmetic hash large range; do
             echo "--- $circuit ---"
@@ -59,15 +67,34 @@ jobs:
               -t evm
           done
 
-      - name: Reject corrupted proof (armory-verifier)
+      - name: Reject corrupted proof (wasm)
         run: |
-          cp artifacts/example/proof /tmp/bad_proof
-          python3 -c "d=bytearray(open('/tmp/bad_proof','rb').read()); d[100]^=1; open('/tmp/bad_proof','wb').write(d)"
-          ! ./target/release/armory-verifier -p /tmp/bad_proof -k artifacts/example/vk -i artifacts/example/public_inputs 2>/dev/null
+          cp -r artifacts /tmp/bad
+          python3 -c "d=bytearray(open('/tmp/bad/example/proof','rb').read()); d[100]^=1; open('/tmp/bad/example/proof','wb').write(d)"
+          # wasm-smoke exits non-zero if any circuit reports non-VALID
+          ! tools/wasm-smoke/target/release/wasm-smoke \
+              target/wasm32-unknown-unknown/release-wasm/armory_verifier.wasm \
+              /tmp/bad 2>/dev/null
 
-      - name: Reject corrupted proof (bb verify)
-        run: |
-          ! bb verify -p /tmp/bad_proof -k artifacts/example/vk -i artifacts/example/public_inputs -t evm 2>/dev/null
+  qemu-armv7:
+    name: Verify under QEMU Cortex-A7 (wasmi interpreter)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Set up QEMU (armv7 binfmt)
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm
+
+      - name: Build verifier-wasm-smoke (linux/arm/v7)
+        run: docker compose build verifier-wasm-smoke
+
+      - name: Run verifier under QEMU Cortex-A7 + wasmi
+        run: docker compose run --rm verifier-wasm-smoke
 
   lint:
     name: Lint
@@ -77,36 +104,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+          targets: wasm32-unknown-unknown
       - name: Check formatting
         run: cargo fmt -- --check
-      - name: Clippy
-        run: cargo clippy -- -D warnings
-
-  build-arm:
-    name: Build ARM (Cortex-A7, no NEON)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-        with:
-          platforms: arm
-
-      - name: Build ARM image
-        run: docker build --platform linux/arm/v7 -f Dockerfile.arm -t armory-verifier:arm .
-
-      - name: Verify all circuits (ARM)
-        run: |
-          for circuit in example arithmetic hash large range; do
-            echo "--- $circuit ---"
-            docker run --rm --platform linux/arm/v7 \
-              -v ${{ github.workspace }}/artifacts:/data/artifacts:ro \
-              armory-verifier:arm \
-              -p /data/artifacts/$circuit/proof \
-              -k /data/artifacts/$circuit/vk \
-              -i /data/artifacts/$circuit/public_inputs
-          done
+      - name: Clippy (native lib)
+        run: cargo clippy --lib --no-default-features -- -D warnings
+      - name: Clippy (wasm lib)
+        run: cargo clippy --lib --target wasm32-unknown-unknown --no-default-features -- -D warnings
+      - name: Clippy (smoke harness)
+        run: cargo clippy --manifest-path tools/wasm-smoke/Cargo.toml -- -D warnings

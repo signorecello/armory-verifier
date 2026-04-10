@@ -92,6 +92,7 @@ fn check_evals_consistency(
     // Compute vanishing polynomial: r^256 - 1
     let vanishing_poly_eval = gemini_r.pow([SUBGROUP_SIZE as u64]) - one;
     if vanishing_poly_eval == Fr::from(0u64) {
+        #[cfg(feature = "debug-log")]
         eprintln!("Gemini challenge is in subgroup!");
         return false;
     }
@@ -408,6 +409,7 @@ pub fn verify_shplemini(
         proof.libra_evaluation,
         log_n,
     ) {
+        #[cfg(feature = "debug-log")]
         eprintln!("Shplemini: Libra consistency check failed");
         return false;
     }

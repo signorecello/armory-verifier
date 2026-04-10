@@ -1,72 +1,134 @@
 # armory-verifier
 
-A minimal, standalone Ultra Honk ZK proof verifier targeting the [USB Armory MK II](https://github.com/usbarmory/usbarmory/wiki/Mk-II-Introduction) -- a USB-stick-sized embedded device with an ARM Cortex-A7 @ 900 MHz (no NEON).
+A minimal, standalone Ultra Honk ZK proof verifier built to run inside [WaTZ](https://dl.acm.org/doi/10.1145/3464298.3493363) — a WebAssembly trusted runtime for ARM TrustZone — on the [USB Armory MK II](https://github.com/usbarmory/usbarmory/wiki/Mk-II-Introduction).
 
-Translates the barretenberg Solidity verifier into ~1,600 lines of Rust. Verifies any Ultra Honk ZK proof (Keccak flavor) in under 600ms on ARM.
+Translates the barretenberg Solidity verifier into ~1,600 lines of Rust, compiled to `wasm32-unknown-unknown`. Verifies any Ultra Honk ZK proof (Keccak flavor) through a small C-ABI surface designed to be called from an OP-TEE Trusted Application.
 
-## Quick start
+## Interface
 
-```bash
-# Build
-cargo build --release
+The only public interface is the wasm module. It exports:
 
-# Verify a proof (same flags as bb verify)
-./target/release/armory-verifier -p <proof> -k <vk> -i <public_inputs>
-# Prints VALID (exit 0) or INVALID (exit 1)
+| Export | Signature | Purpose |
+|--------|-----------|---------|
+| `verifier_abi_version` | `() -> u32` | Host version check |
+| `verifier_alloc` | `(len: u32) -> *mut u8` | Allocate a buffer in linear memory |
+| `verifier_dealloc` | `(ptr: *mut u8, len: u32) -> ()` | Free a buffer |
+| `verifier_verify` | `(proof_ptr, proof_len, vk_ptr, vk_len, pi_ptr, pi_len, vk_hash_ptr, vk_hash_len) -> i32` | Verify a proof |
 
-# Verify included test artifacts
-./target/release/armory-verifier -p artifacts/example/proof -k artifacts/example/vk -i artifacts/example/public_inputs
-```
+`verifier_verify` returns `1` for VALID, `0` for INVALID, `-1` if a panic was caught (malformed input). The module imports nothing — no WASI, no host syscalls.
 
-## Docker
+## Verifying artifacts
 
-Build and run using Docker -- supports native and ARM emulation via QEMU. Artifacts are bind-mounted from `./artifacts/`, so you can swap test vectors without rebuilding images.
+There are two supported ways to run the verifier — both take the same `.wasm` module, just a different host. The wasm build itself is architecture-independent, so build once and drive it from either path.
 
-```bash
-# Verify a single proof (native)
-docker compose run --rm verifier -p /data/artifacts/example/proof -k /data/artifacts/example/vk -i /data/artifacts/example/public_inputs
+### 1. Natively (fast local iteration)
 
-# Verify on emulated ARM (Cortex-A7, no NEON -- matches USB Armory MK II)
-docker compose run --rm verifier-arm -p /data/artifacts/example/proof -k /data/artifacts/example/vk -i /data/artifacts/example/public_inputs
-
-# Benchmark all circuits (native)
-docker compose run --rm benchmark
-
-# Benchmark all circuits (ARM emulated)
-docker compose run --rm benchmark-arm
-```
-
-Build images individually:
+Build the module once, then drive it from the smoke harness on your host machine. This still runs through the wasmi interpreter (no JIT) so the output is a faithful functional check of the WaTZ code path — just running on your laptop's CPU instead of an emulated Cortex-A7.
 
 ```bash
-# Native
-docker build -t armory-verifier .
+# One-time setup
+rustup target add wasm32-unknown-unknown
 
-# ARM (requires Docker with QEMU binfmt support -- Docker Desktop includes this)
-docker build --platform linux/arm/v7 -f Dockerfile.arm -t armory-verifier:arm .
+# Build the wasm module (~216 KB, ~180 KB after wasm-opt)
+cargo build \
+  --profile release-wasm \
+  --target wasm32-unknown-unknown \
+  --no-default-features \
+  --lib
+
+# Verify all bundled test circuits
+cargo run --manifest-path tools/wasm-smoke/Cargo.toml --release -- \
+  target/wasm32-unknown-unknown/release-wasm/armory_verifier.wasm \
+  artifacts
 ```
 
-The ARM Dockerfile sets `RUSTFLAGS="-C target-cpu=cortex-a7 -C target-feature=-neon"` to match the USB Armory MK II's i.MX6ULZ (Cortex-A7, no NEON SIMD).
+Expected output (Apple Silicon, ~120 ms per circuit under wasmi):
 
-## Benchmarks
+```
+=== WASM interpreter benchmark (target/wasm32-unknown-unknown/release-wasm/armory_verifier.wasm) ===
+    engine: wasmi (pure-Rust interpreter, ~WAMR classic-interp)
+  example     VALID     120.441ms
+  arithmetic  VALID     113.884ms
+  hash        VALID     113.191ms
+  large       VALID     119.665ms
+  range       VALID     121.057ms
+All circuits VALID.
+```
 
-Run the benchmark script locally:
+Point the harness at any directory that contains one or more `<circuit>/{proof,vk,public_inputs,vk_hash}` subdirectories. The harness walks a fixed list (`example`, `arithmetic`, `hash`, `large`, `range`) so a custom set needs to reuse those names:
 
 ```bash
-cargo build --release
-./scripts/benchmark.sh
+mkdir -p /tmp/mycircuit/example
+cp my_proof           /tmp/mycircuit/example/proof
+cp my_vk              /tmp/mycircuit/example/vk
+cp my_public_inputs   /tmp/mycircuit/example/public_inputs
+cp my_vk_hash         /tmp/mycircuit/example/vk_hash   # optional
+
+cargo run --manifest-path tools/wasm-smoke/Cargo.toml --release -- \
+  target/wasm32-unknown-unknown/release-wasm/armory_verifier.wasm \
+  /tmp/mycircuit
 ```
 
-Or via Docker:
+The harness exits `0` if every circuit it finds verifies as `VALID`, non-zero otherwise.
+
+### 2. Under the ARMv7 QEMU emulator (WaTZ-like environment)
+
+`verifier-wasm-smoke` runs the same .wasm inside an environment that mimics the USB Armory MK II running WaTZ as closely as Docker + QEMU allow:
+
+- **Platform**: `linux/arm/v7` under user-mode QEMU ARMv7 emulation
+- **CPU tuning**: `-C target-cpu=cortex-a7`, no NEON (matches the i.MX6ULZ)
+- **WASM runtime**: [`wasmi`](https://github.com/wasmi-labs/wasmi) pure-Rust interpreter — no JIT, no code generation. Characteristics match [WAMR](https://github.com/bytecodealliance/wasm-micro-runtime)'s `classic-interp` mode, which is what WaTZ embeds inside an OP-TEE Trusted Application.
+- **Entry point**: `verifier_alloc` / `verifier_dealloc` / `verifier_verify` exactly as a WaTZ TA would call them.
+
+Requires Docker Desktop (macOS/Windows) or Docker + `qemu-user-static` + `binfmt_misc` (Linux) so that `linux/arm/v7` containers can execute via binfmt emulation. The compose file handles everything else.
 
 ```bash
-docker compose run --rm benchmark       # native
-docker compose run --rm benchmark-arm   # ARM emulated
+# Build and run the benchmark against the bundled test circuits
+docker compose run --rm verifier-wasm-smoke
 ```
 
-### Results
+Expected output (QEMU Cortex-A7, ~2 s per circuit):
 
-Five test circuits with varying complexity (all verified correctly):
+```
+=== WASM interpreter benchmark (/opt/armory_verifier.wasm) ===
+    engine: wasmi (pure-Rust interpreter, ~WAMR classic-interp)
+  example     VALID     2.088942s
+  arithmetic  VALID     1.983544s
+  hash        VALID     2.015538s
+  large       VALID     2.063180s
+  range       VALID     2.151043s
+All circuits VALID.
+```
+
+Swap in your own artifacts by bind-mounting a directory over `/data/artifacts`:
+
+```bash
+docker compose run --rm \
+  -v /path/to/my/artifacts:/data/artifacts:ro \
+  verifier-wasm-smoke
+```
+
+The container's entrypoint is `wasm-smoke /opt/armory_verifier.wasm /data/artifacts`, so any directory layout the native harness accepts works here too.
+
+To just build the wasm module and copy it out (no QEMU needed — this stops at the native `export` stage):
+
+```bash
+docker compose run --rm verifier-wasm
+# -> ./out/armory_verifier.wasm
+```
+
+The Dockerfile runs `wasm-opt -Oz` on the module. Size after opt: ~180 KB. Module imports: **0** (fully self-contained — no WASI, no host syscalls).
+
+### Benchmark results
+
+| Environment | Runtime | Time per circuit |
+|-------------|---------|------------------|
+| macOS Apple Silicon (native) | wasmi interpreter | ~120 ms |
+| Docker linux/arm/v7 (QEMU Cortex-A7) | wasmi interpreter | **~2.0 s** |
+
+QEMU user-mode emulation is not cycle-accurate — the relevant signal is the relative slowdown between native ARM code and a pure interpreter running wasm, which stays in the same order of magnitude whether you're on emulated or real Cortex-A7. On a real 900 MHz i.MX6ULZ under WAMR inside a WaTZ TA, expect timings in the same 1–3 s range per proof.
+
+## Test circuits
 
 | Circuit | Description | N | log_n | Proof |
 |---------|-------------|---|-------|-------|
@@ -76,140 +138,50 @@ Five test circuits with varying complexity (all verified correctly):
 | large | 100 rounds of field mixing | 2048 | 11 | 7,104B |
 | range | Range + even check | 4096 | 12 | 7,488B |
 
-| Platform | Verification Time |
-|----------|------------------|
-| macOS (Apple Silicon) | 4--8 ms |
-| Docker native (x86_64) | 4--8 ms |
-| Docker ARM emulated (Cortex-A7, no NEON) | 500--550 ms |
-
-The BN254 pairing check dominates runtime, so verification time is nearly constant regardless of circuit size.
-
-## Deploying to USB Armory MK II
-
-The USB Armory MK II runs Debian Linux on an ARM Cortex-A7 (no NEON). The verifier binary is a standard Linux ELF.
-
-### Build the ARM binary
-
-```bash
-# Docker (recommended -- no cross-toolchain needed)
-docker build --platform linux/arm/v7 -f Dockerfile.arm -t armory-verifier:arm .
-docker create --name av-extract armory-verifier:arm
-docker cp av-extract:/usr/local/bin/armory-verifier ./armory-verifier-arm
-docker rm av-extract
-```
-
-Or cross-compile natively (requires `arm-linux-gnueabihf-gcc`):
-
-```bash
-rustup target add armv7-unknown-linux-gnueabihf
-RUSTFLAGS="-C target-cpu=cortex-a7 -C target-feature=-neon" \
-  cargo build --release --target armv7-unknown-linux-gnueabihf
-```
-
-### Deploy and run
-
-```bash
-# Copy binary and proof artifacts to the device
-scp armory-verifier-arm usbarmory:/usr/local/bin/armory-verifier
-scp -r artifacts/ usbarmory:/opt/verifier/
-
-# Run on the device
-ssh usbarmory 'time armory-verifier -p /opt/verifier/example/proof -k /opt/verifier/example/vk -i /opt/verifier/example/public_inputs'
-```
-
-### Expected performance
-
-| Spec | Value |
-|------|-------|
-| CPU | NXP i.MX6ULZ, Cortex-A7 @ 900 MHz, no NEON |
-| RAM usage | < 1 MB |
-| Crypto HW | None for ECC/pairings (DCP: AES-128 + SHA-256 only) |
-| Expected verification | ~500 ms (based on QEMU-emulated benchmarks) |
-
-## Deploying to Raspberry Pi
-
-Works on any ARMv7+ Raspberry Pi (Pi 2, 3, 4, Zero 2 W) running Raspberry Pi OS. Same Docker build approach:
-
-```bash
-docker build --platform linux/arm/v7 -f Dockerfile.arm -t armory-verifier:arm .
-docker create --name av-extract armory-verifier:arm
-docker cp av-extract:/usr/local/bin/armory-verifier ./armory-verifier-arm
-docker rm av-extract
-
-scp armory-verifier-arm pi@raspberrypi:/usr/local/bin/armory-verifier
-scp -r artifacts/ pi@raspberrypi:~/verifier/
-ssh pi@raspberrypi 'time armory-verifier -p ~/verifier/example/proof -k ~/verifier/example/vk -i ~/verifier/example/public_inputs'
-```
-
-On a Raspberry Pi 4 (Cortex-A72 @ 1.5 GHz), verification should be significantly faster due to the out-of-order pipeline, higher clock, and NEON support. For Pi-optimized builds, use `Dockerfile` (without the `-neon` flag) instead of `Dockerfile.arm`.
-
-## Test circuits
-
-Source code for all test circuits is in `circuits/`. Each has:
-
-- `main.nr` -- Noir circuit source
-- `Prover.toml` -- Witness inputs
-- `Nargo.toml` -- Project config
-
-Pre-generated artifacts (proof, vk, vk_hash, public_inputs) are in `artifacts/`.
+Pre-generated artifacts live under `artifacts/<circuit>/{proof,vk,vk_hash,public_inputs}`.
 
 ### Regenerating proofs
 
 Requires [nargo](https://noir-lang.org/) and [bb](https://github.com/AztecProtocol/aztec-packages/tree/master/barretenberg) (barretenberg CLI):
 
 ```bash
-# Install Noir
 curl -L https://raw.githubusercontent.com/noir-lang/noirup/refs/heads/main/install | bash
 noirup
-
-# Install barretenberg
 curl -L https://raw.githubusercontent.com/AztecProtocol/aztec-packages/refs/heads/master/barretenberg/bbup/install | bash
 bbup
 
-# Generate all proof artifacts
 ./scripts/generate-proofs.sh
-```
-
-### Using your own circuit
-
-```bash
-# 1. Compile your Noir circuit
-cd your-circuit && nargo execute
-
-# 2. Generate VK and proof (EVM/Keccak/ZK flavor)
-bb write_vk -b target/your_circuit.json -t evm -o target/vk_out
-bb prove -b target/your_circuit.json -w target/your_circuit.gz -k target/vk_out/vk -t evm -o target/
-
-# 3. Verify (same flags as bb verify)
-armory-verifier -p target/proof -k target/vk_out/vk -i target/public_inputs
 ```
 
 ## How it works
 
 The verifier implements the Ultra Honk ZK verification protocol over BN254:
 
-1. **Fiat-Shamir transcript** -- derives all challenges via Keccak-256 (matching the EVM/Solidity flavor)
-2. **Sumcheck** -- verifies `log(N)` rounds of the sumcheck protocol with Barycentric evaluation
-3. **Relations** -- evaluates 28 subrelations (arithmetic, permutation, lookup, range, elliptic, memory, NNF, Poseidon2) and batches them with alpha powers
-4. **Shplemini** -- batch polynomial opening via Gemini folding + Shplonk batching
-5. **KZG pairing** -- final verification with one BN254 Ate pairing check
+1. **Fiat-Shamir transcript** — derives all challenges via Keccak-256 (matching the EVM/Solidity flavor)
+2. **Sumcheck** — verifies `log(N)` rounds of the sumcheck protocol with Barycentric evaluation
+3. **Relations** — evaluates 28 subrelations (arithmetic, permutation, lookup, range, elliptic, memory, NNF, Poseidon2) and batches them with alpha powers
+4. **Shplemini** — batch polynomial opening via Gemini folding + Shplonk batching
+5. **KZG pairing** — final verification with one BN254 Ate pairing check
 
-### Binary size and dependencies
+## USB Armory MK II + WaTZ
 
-| Component | Size |
-|-----------|------|
-| Stripped release binary (macOS) | ~930 KB |
-| Stripped release binary (ARM) | ~2.4 MB |
-| Peak RAM usage | < 1 MB |
+| Spec | Value |
+|------|-------|
+| CPU | NXP i.MX6ULZ, Cortex-A7 @ 900 MHz, no NEON |
+| TEE | OP-TEE (ARM TrustZone) |
+| Runtime | WaTZ (WAMR-based WASM interpreter inside an OP-TEE TA) |
+| Verifier memory | < 1 MB working set |
+| Module imports | 0 (self-contained) |
 
-Dependencies: `ark-bn254`, `ark-ec`, `ark-ff` (elliptic curve + field arithmetic), `tiny-keccak` (Keccak-256), `num-bigint` (challenge splitting).
+The ~2 MB / 8 MB linear-memory caps are configured via `.cargo/config.toml`. QEMU Cortex-A7 + wasmi-interp timings (see the Docker section above) sit around **2.0 s per circuit**; the authoritative number will come from running under WAMR inside a real WaTZ TA on the Armory, but the order of magnitude should match.
 
 ## Project structure
 
 ```
 armory-verifier/
   src/
-    main.rs            Entry point, CLI, public input delta
+    lib.rs             Public verify() entry point + module root
+    wasm.rs            C-ABI exports (compiled only for wasm32-*)
     types.rs           Proof, VK, Transcript structs
     constants.rs       BN254 field constants
     deserialize.rs     Binary proof/VK/public_inputs parsing
@@ -217,13 +189,17 @@ armory-verifier/
     relations.rs       9 relation evaluators (28 subrelations)
     sumcheck.rs        Sumcheck loop + Barycentric evaluation
     shplemini.rs       Batch opening + KZG pairing check
+  tools/
+    wasm-smoke/        Host harness: loads the .wasm into the wasmi
+                       interpreter and verifies every circuit through
+                       the C-ABI. Cross-compiles cleanly to armv7 for
+                       the QEMU Cortex-A7 benchmark.
   artifacts/           Pre-generated proof artifacts per circuit
   circuits/            Noir circuit source code
   scripts/
-    benchmark.sh       Local benchmark runner
     generate-proofs.sh Regenerate all proof artifacts
-  Dockerfile           Native multi-stage build
-  Dockerfile.arm       ARM (Cortex-A7, no NEON) build for USB Armory
-  docker-compose.yml   Run and benchmark on native + ARM
+  .cargo/config.toml   wasm32 linker flags (initial/max memory)
+  Dockerfile.wasm      Wasm module + smoke harness multi-stage build
+  docker-compose.yml   verifier-wasm build + verifier-wasm-smoke services
   CLAUDE.md            Protocol details and implementation notes
 ```
